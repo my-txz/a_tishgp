@@ -1,0 +1,523 @@
+import akshare as ak
+import pandas as pd
+import numpy as np
+import os
+import time
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import warnings
+import platform
+
+# 忽略警告
+warnings.filterwarnings("ignore")
+
+# ==========================================
+# 1. 智能路径配置 (Win/Linux 兼容)
+# ==========================================
+def get_output_dir():
+    """跨平台获取桌面路径"""
+    system = platform.system()
+    if system == "Windows":
+        home = os.environ.get('USERPROFILE', '.')
+    else:
+        home = os.environ.get('HOME', '.')
+        
+    desktop = os.path.join(home, 'Desktop')
+    if not os.path.exists(desktop):
+        desktop = os.getcwd()
+    
+    folder_name = "股票分析_Top15"
+    output_path = os.path.join(desktop, folder_name)
+    
+    if not os.path.exists(output_path):
+        try:
+            os.makedirs(output_path)
+            print(f"Created folder: {output_path}")
+        except Exception as e:
+            print(f"Warning: Could not create folder. Saving to Desktop instead. Error: {e}")
+            output_path = desktop
+            
+    return output_path
+
+OUTPUT_DIR = get_output_dir()
+
+# ==========================================
+# 2. 配置参数
+# ==========================================
+POOL_SIZE = 200            # 扩大扫描池，确保能选出Top 15优质股
+TOP_N_STOCKS = 15          # 推荐 Top 15
+ANALYSIS_DAYS = 120        # 历史分析深度
+CAPITAL = 100000           # 模拟本金
+RISK_RATIO = 0.02          # 单笔风险 2%
+
+plt.style.use('dark_background')
+
+# ==========================================
+# 3. 核心数据获取
+# ==========================================
+def fetch_market_environment():
+    """获取沪深300指数，判断市场牛熊"""
+    try:
+        df = ak.index_zh_a_hist(symbol="000300", period="daily", start_date="20240101", end_date=datetime.now().strftime('%Y%m%d'))
+        if df.empty: return "Neutral"
+        ma20 = df['收盘'].rolling(20).mean().iloc[-1]
+        current = df['收盘'].iloc[-1]
+        return "Bullish" if current > ma20 else "Bearish"
+    except:
+        return "Neutral"
+
+def fetch_data(code):
+    """获取历史日线数据"""
+    end_date = datetime.now().strftime('%Y%m%d')
+    start_date = (datetime.now() - timedelta(days=300)).strftime('%Y%m%d') # 足够计算所有长周期指标
+    
+    try:
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
+        if df.empty: return None
+        df.rename(columns={'开盘':'open', '收盘':'close', '最高':'high', '最低':'low', '成交量':'volume', '日期':'date'}, inplace=True)
+        df['date'] = pd.to_datetime(df['date'])
+        return df
+    except: return None
+
+# ==========================================
+# 4. 算法引擎 (三重滤网 + 新增威廉/乖离 + 盘口分析)
+# ==========================================
+def calculate_mfi_safe(df, period=14):
+    """MFI 安全计算"""
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    money_flow = typical_price * df['volume']
+    positive_flow = money_flow.copy()
+    negative_flow = money_flow.copy()
+    
+    flow_change = typical_price.diff()
+    for i in range(1, len(df)):
+        if flow_change[i] > 0:
+            negative_flow[i] = 0
+        else:
+            positive_flow[i] = 0
+            
+    positive_mf = positive_flow.rolling(window=period, min_periods=period).sum()
+    negative_mf = negative_flow.rolling(window=period, min_periods=period).sum()
+    
+    ratio = np.where(negative_mf == 0, 100, positive_mf / negative_mf)
+    mfi = 100 - (100 / (1 + ratio))
+    return mfi
+
+def calculate_super_indicators(df):
+    """计算全套技术指标 (新增 Williams %R 和 BIAS)"""
+    df = df.copy()
+    
+    # --- 基础均线 ---
+    df['ma5'] = df['close'].rolling(5).mean()
+    df['ma10'] = df['close'].rolling(10).mean()
+    df['ma20'] = df['close'].rolling(20).mean()
+    df['ma60'] = df['close'].rolling(60).mean()
+    
+    # --- MACD ---
+    exp12 = df['close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd_dif'] = exp12 - exp26
+    df['macd_dea'] = df['macd_dif'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = (df['macd_dif'] - df['macd_dea']) * 2
+    df['macd_slope'] = df['macd_hist'].diff()
+    
+    # --- KDJ ---
+    low_list = df['low'].rolling(9, min_periods=9).min()
+    high_list = df['high'].rolling(9, min_periods=9).max()
+    rsv = (df['close'] - low_list) / (high_list - low_list) * 100
+    df['kdj_k'] = rsv.ewm(com=2).mean()
+    df['kdj_d'] = df['kdj_k'].ewm(com=2).mean()
+    df['kdj_j'] = 3 * df['kdj_k'] - 2 * df['kdj_d']
+    
+    # --- RSI ---
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # --- 新增算法1: Williams %R (威廉指标) ---
+    # 判断短期超卖/超买，-100 to 0. > -80 超买, < -20 超卖 (注意这里用负数习惯)
+    # 通常 > -20 是超买, < -80 是超卖.
+    high_14 = df['high'].rolling(window=14).max()
+    low_14 = df['low'].rolling(window=14).min()
+    df['wr'] = -100 * ((high_14 - df['close']) / (high_14 - low_14))
+    
+    # --- 新增算法2: BIAS (乖离率) ---
+    # 判断偏离均线的程度
+    df['bias_6'] = (df['close'] - df['ma5']) / df['ma5'] * 100
+    df['bias_12'] = (df['close'] - df['ma10']) / df['ma10'] * 100
+    
+    # --- ATR & BOLL ---
+    tr1 = df['high'] - df['low']
+    tr2 = abs(df['high'] - df['close'].shift())
+    tr3 = abs(df['low'] - df['close'].shift())
+    df['atr'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1).rolling(14).mean()
+    df['boll_mid'] = df['close'].rolling(20).mean()
+    std = df['close'].rolling(20).std()
+    df['boll_upper'] = df['boll_mid'] + (std * 2)
+    df['boll_lower'] = df['boll_mid'] - (std * 2)
+    
+    # --- OBV & MFI ---
+    df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+    df['obv_ma'] = df['obv'].rolling(20).mean()
+    df['mfi'] = calculate_mfi_safe(df)
+    
+    return df
+
+def analyze_intraday_strength(spot_row, hist_df):
+    """
+    新增：盘口实时分析
+    计算量比、振幅、开盘强弱
+    """
+    try:
+        # 提取实时数据
+        price_now = float(spot_row['最新价'])
+        price_open = float(spot_row['今开'])
+        price_high = float(spot_row['最高'])
+        price_low = float(spot_row['最低'])
+        vol_now = float(spot_row['成交量']) if isinstance(spot_row['成交量'], (int, float)) else 0
+        vol_avg_5 = hist_df['volume'].tail(5).mean() # 过去5天平均成交量
+        
+        # 1. 量比 = 当前成交量 / 过去平均成交量 (按时间折算)
+        # 简化处理：直接比较总量的倍数关系
+        vol_ratio = vol_now / vol_avg_5 if vol_avg_5 > 0 else 1.0
+        
+        # 2. 今日振幅 = (High - Low) / Open
+        amplitude = (price_high - price_low) / price_open * 100
+        
+        # 3. 盘中强弱 = 现价 / 开盘价
+        intraday_strength = (price_now - price_open) / price_open * 100
+        
+        return {
+            'vol_ratio': round(vol_ratio, 2),
+            'amplitude': round(amplitude, 2),
+            'intraday_pct': round(intraday_strength, 2)
+        }
+    except:
+        return {'vol_ratio': 1.0, 'amplitude': 0, 'intraday_pct': 0}
+
+def apply_triple_screen(df):
+    """三重滤网逻辑"""
+    if len(df) < 60: return 'Neutral', 'Data Insufficient'
+    curr = df.iloc[-1]
+    
+    # Screen 1: MACD Slope
+    slope = curr['macd_slope']
+    if pd.isna(slope) or slope <= 0: return 'Neutral', 'Screen 1: Trend Down/Flat'
+    
+    # Screen 2: RSI Dip
+    rsi_val = curr['rsi']
+    if pd.isna(rsi_val) or rsi_val > 65: return 'Neutral', 'Screen 2: No Pullback'
+    
+    # Screen 3: Entry
+    prev = df.iloc[-2]
+    is_stop_fall = curr['close'] > prev['close']
+    is_strong = curr['close'] > curr['ma5']
+    
+    if is_stop_fall and is_strong:
+        return 'Bullish Setup', 'Trend Up + RSI Dip + Breakout'
+    elif is_stop_fall:
+        return 'Bullish Setup', 'Trend Up + RSI Dip'
+    else:
+        return 'Neutral', 'Screen 3: Waiting Action'
+
+def detect_advanced_scam(df):
+    """杀猪盘检测"""
+    if len(df) < 60: return False, "Safe"
+    curr = df.iloc[-1]
+    ma60 = curr['ma60']
+    if pd.isna(ma60): return False, "Safe"
+    
+    is_high_price = curr['close'] > (ma60 * 1.2)
+    if not is_high_price: return False, "Safe"
+    
+    recent_vol = df['volume'].iloc[-3:]
+    vol_ma5 = df['volume'].rolling(5).mean().iloc[-1]
+    if pd.isna(vol_ma5): return False, "Safe"
+    
+    is_sustained_huge_vol = (recent_vol > vol_ma5 * 2).all()
+    body_low = min(curr['open'], curr['close'])
+    upper_shadow = curr['high'] - body_low
+    total_range = curr['high'] - curr['low']
+    
+    if total_range == 0: is_long_shadow = False
+    else: is_long_shadow = (upper_shadow / total_range) > 0.5
+    
+    if is_sustained_huge_vol and is_long_shadow:
+        return True, "Risk: High Pos + Huge Vol + Shadow"
+    return False, "Safe"
+
+def score_stock(hist_df, spot_row, market_env):
+    """
+    综合评分：历史趋势 + 实时盘口
+    """
+    if hist_df is None or len(hist_df) < 90: return None 
+    
+    df = calculate_super_indicators(hist_df)
+    curr = df.iloc[-1]
+    
+    # --- 实时盘口分析 (近几小时) ---
+    intraday = analyze_intraday_strength(spot_row, df)
+    
+    # --- 1. 风险过滤 ---
+    is_scam, scam_reason = detect_advanced_scam(df)
+    if is_scam: return {'score': 0, 'reason': scam_reason}
+    
+    mfi_val = curr['mfi'] if not pd.isna(curr['mfi']) else 50
+    if mfi_val > 90: return {'score': 0, 'reason': 'MFI Extreme Risk'}
+    
+    # --- 2. 三重滤网 ---
+    tsts_status, tsts_msg = apply_triple_screen(df)
+    if tsts_status != 'Bullish Setup': return {'score': 0, 'reason': tsts_msg}
+    
+    # --- 3. 评分计算 (总分100+) ---
+    score = 0
+    reasons = [f"TSTSS: {tsts_msg}"]
+    
+    # 基础分：通过三重滤网 (50分)
+    score += 50
+    
+    # A. 趋势与位置 (20分)
+    if not pd.isna(curr['ma20']) and not pd.isna(curr['ma60']):
+        if curr['close'] > curr['ma20'] > curr['ma60']:
+            score += 20
+            reasons.append("Strong Trend")
+        
+    # B. 新算法：Williams %R (10分)
+    # -100 到 -80 为超卖区域，若此时反弹则为信号
+    wr_val = curr['wr'] if not pd.isna(curr['wr']) else -50
+    if -90 < wr_val < -70:
+        score += 10
+        reasons.append("WR Oversold Rebound")
+        
+    # C. 新算法：BIAS 乖离率 (10分)
+    # BIAS 适中，说明没有短期透支
+    bias_val = curr['bias_12'] if not pd.isna(curr['bias_12']) else 0
+    if -2 < bias_val < 5:
+        score += 10
+        reasons.append("BIAS Healthy")
+        
+    # D. 实时盘口加分 (近几小时表现) (10分)
+    # 量比 > 1.5 说明活跃
+    if intraday['vol_ratio'] > 1.5:
+        score += 5
+        reasons.append("High Vol Ratio")
+    # 盘中涨幅 > 0
+    if intraday['intraday_pct'] > 0:
+        score += 5
+        reasons.append("Intraday Strong")
+    
+    # --- 4. 动态止损 ---
+    current_atr = curr['atr'] if not pd.isna(curr['atr']) else 1.0
+    atr_avg_30 = df['atr'].rolling(30).mean().iloc[-1] if len(df)>30 else current_atr
+    if pd.isna(atr_avg_30): atr_avg_30 = current_atr
+    
+    vol_ratio = current_atr / atr_avg_30 if atr_avg_30 > 0 else 1.0
+    atr_mult = 2.0 if vol_ratio < 0.8 else (1.0 if vol_ratio > 1.5 else 1.5)
+    
+    stop_loss = curr['close'] - (current_atr * atr_mult)
+    take_profit = curr['close'] + (current_atr * 3.0)
+    
+    price_floor = df['low'].iloc[-20:].min() * 0.95
+    if stop_loss < price_floor: stop_loss = price_floor
+    
+    risk_per_share = curr['close'] - stop_loss
+    if risk_per_share <= 0: risk_per_share = curr['close'] * 0.05
+        
+    shares = int((CAPITAL * RISK_RATIO) / risk_per_share)
+    shares = (shares // 100) * 100
+    if shares < 100: shares = 100
+    
+    return {
+        'score': score,
+        'reasons': reasons,
+        'intraday': intraday,
+        'setup': tsts_status,
+        'df_analysis': df,
+        'current_data': curr,
+        'shares': shares,
+        'stop_loss': stop_loss,
+        'take_profit': take_profit
+    }
+
+# ==========================================
+# 5. 可视化模块 (含实时数据标注)
+# ==========================================
+def generate_stock_chart(code, name, analysis_data, intraday_data):
+    df = analysis_data['df_analysis'].tail(ANALYSIS_DAYS) 
+    curr = analysis_data['current_data']
+    score = analysis_data['score']
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 10), gridspec_kw={'height_ratios': [3, 1.5, 1]})
+    
+    # Plot 1: Price
+    ax1.plot(df['date'], df['close'], label='Close', color='white', linewidth=2)
+    ax1.plot(df['date'], df['ma20'], label='MA20', color='yellow', linestyle='--')
+    ax1.plot(df['date'], df['ma60'], label='MA60', color='cyan', linestyle=':')
+    
+    current_date = df['date'].iloc[-1]
+    ax1.scatter(current_date, curr['close'], color='lime', s=100, zorder=5, label='Entry')
+    ax1.text(current_date, curr['close'], f"  {curr['close']:.2f}", color='lime', fontsize=12, fontweight='bold')
+    
+    # 标注实时盘口信息
+    info_text = f"Today: +{intraday_data['intraday_pct']}% | VolRatio: {intraday_data['vol_ratio']}x"
+    ax1.text(df['date'].iloc[0], df['boll_upper'].max(), info_text, color='orange', fontsize=9, bbox=dict(facecolor='black', alpha=0.5))
+
+    ax1.set_title(f"{code} {name} - Analysis (Score: {score})", fontsize=14, color='white')
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: MACD & WR (Combined for efficiency)
+    ax2.bar(df['date'], df['macd_hist'], color=['g' if x > 0 else 'r' for x in df['macd_hist']], label='MACD', alpha=0.5)
+    ax2.plot(df['date'], df['macd_dif'], label='DIF', color='cyan')
+    ax2.axhline(0, color='white', linewidth=0.5)
+    
+    # Secondary axis for Williams %R
+    ax2_wr = ax2.twinx()
+    ax2_wr.plot(df['date'], df['wr'], label='Williams %R', color='magenta', linestyle='--', alpha=0.6)
+    ax2_wr.axhline(-20, color='red', linestyle=':', alpha=0.5)
+    ax2_wr.axhline(-80, color='green', linestyle=':', alpha=0.5)
+    ax2_wr.set_ylim(-100, 0)
+    ax2_wr.legend(loc='lower left', fontsize=8)
+    
+    ax2.set_title("Momentum (MACD + Williams %R)", fontsize=10, color='yellow')
+    ax2.legend(loc='upper left', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: RSI & BIAS
+    ax3.plot(df['date'], df['rsi'], label='RSI', color='orange', linewidth=2)
+    ax3.plot(df['date'], df['bias_12']*10 + 50, label='BIAS (Scaled)', color='cyan', linestyle='--', alpha=0.7) # 放大显示
+    ax3.axhline(30, color='green', linestyle='--', alpha=0.5) 
+    ax3.axhline(70, color='red', linestyle='--', alpha=0.5)   
+    ax3.fill_between(df['date'], 30, 70, color='gray', alpha=0.1) 
+    
+    ax3.set_title("Oscillators (RSI + BIAS)", fontsize=10, color='yellow')
+    ax3.legend(loc='upper left', fontsize=8)
+    ax3.grid(True, alpha=0.3)
+    
+    for ax in [ax1, ax2, ax3]:
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        plt.setp(ax.get_xticklabels(), visible=True)
+    
+    filename = f"{OUTPUT_DIR}/{code}_{name}_Top15.png"
+    plt.savefig(filename, dpi=100, bbox_inches='tight')
+    plt.close()
+    return filename
+
+# ==========================================
+# 6. 主程序
+# ==========================================
+def main():
+    start_time = time.time()
+    print("\n" + "="*70)
+    print("  A股AI量化分析系统 v7.0 (Top 15 / Intraday / Williams / BIAS)")
+    print("="*70)
+    
+    print(f"OS: {platform.system()} | Dir: {OUTPUT_DIR}")
+    
+    market_env = fetch_market_environment()
+    print(f"Market Status: {market_env}")
+    
+    print("Scanning Market Liquidity (Pool Size: 200)...")
+    try:
+        spot_df = ak.stock_zh_a_spot_em()
+        # 清洗数据
+        spot_df = spot_df[~spot_df['名称'].str.contains('ST|退|停')]
+        spot_df = spot_df[(spot_df['最新价'] > 3) & (spot_df['最新价'] < 200)] 
+        spot_df = spot_df.sort_values(by='成交额', ascending=False).head(POOL_SIZE)
+    except Exception as e:
+        print("Data fetch failed:", e)
+        return
+        
+    final_results = []
+    
+    print(f"Deep Analyzing with Intraday & New Algorithms...")
+    for idx, row in tqdm(spot_df.iterrows(), total=len(spot_df)):
+        code = row['代码']
+        name = row['名称']
+        price = row['最新价']
+        
+        try:
+            hist_df = fetch_data(code)
+            res = score_stock(hist_df, row, market_env)
+            
+            if res and res['score'] >= 60:
+                final_results.append({
+                    '代码': code,
+                    '名称': name,
+                    '现价': price,
+                    'AI评分': res['score'],
+                    '状态': res['setup'],
+                    '核心逻辑': "，".join(res['reasons']),
+                    '量比': res['intraday']['vol_ratio'],
+                    '今日涨跌': f"{res['intraday']['intraday_pct']}%",
+                    '威廉指标(WR)': round(res['current_data']['wr'], 2),
+                    '乖离率(BIAS)': round(res['current_data']['bias_12'], 2),
+                    'RSI(14)': round(res['current_data']['rsi'], 2),
+                    '买入建议(手)': int(res['shares']/100),
+                    '止损价': round(res['stop_loss'], 2),
+                    '目标价': round(res['take_profit'], 2),
+                    '_raw_data': res
+                })
+        except Exception as inner_e:
+            pass
+        
+        time.sleep(0.15) # 稍微加快一点速度
+        
+    # 3. 筛选 Top 15 并严格排序
+    if not final_results:
+        print("\nNo stocks passed the criteria.")
+        return
+
+    final_results.sort(key=lambda x: x['AI评分'], reverse=True)
+    top_stocks = final_results[:TOP_N_STOCKS]
+    
+    # 添加名次列
+    for i, stock in enumerate(top_stocks):
+        stock['名次'] = i + 1
+    
+    print("\nGenerating Charts & Reports for Top 15...")
+    for stock in tqdm(top_stocks, desc="Processing"):
+        try:
+            chart_file = generate_stock_chart(stock['代码'], stock['名称'], stock['_raw_data'], stock['_raw_data']['intraday'])
+            stock['走势图'] = chart_file
+        except:
+            pass
+        del stock['_raw_data'] 
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M')
+    excel_name = f"{OUTPUT_DIR}/AI_Report_Top15_{timestamp}.xlsx"
+    
+    # 调整列顺序：名次在前
+    cols_order = ['名次', '代码', '名称', '现价', 'AI评分', '量比', '今日涨跌', '威廉指标(WR)', '乖离率(BIAS)', '买入建议(手)', '止损价', '目标价', '状态', '核心逻辑']
+    df_export = pd.DataFrame(top_stocks)[cols_order]
+    
+    with pd.ExcelWriter(excel_name, engine='openpyxl') as writer:
+        df_export.to_excel(writer, index=False, sheet_name='Top15_Analysis')
+        worksheet = writer.sheets['Top15_Analysis']
+        for col in worksheet.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            worksheet.column_dimensions[column].width = min(max_length + 2, 50)
+
+    print("\n" + "="*70)
+    print(f"  Analysis Complete! Top 15 Stocks Generated")
+    print("="*70)
+    
+    print(df_export.to_string(index=False))
+    
+    print(f"\nExcel: {excel_name}")
+    print(f"Folder: {OUTPUT_DIR}")
+    print(f"Total Time: {time.time() - start_time:.2f} sec")
+
+if __name__ == "__main__":
+    main()
